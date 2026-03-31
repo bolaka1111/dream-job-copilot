@@ -1,4 +1,8 @@
-"""JobSearchAgent – search the job market based on resume data."""
+"""JobSearchAgent – search the job market based on resume data.
+
+Each agent is implemented as a LangGraph ReAct agent (create_react_agent) that
+calls LangChain @tool-decorated functions to complete its work.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,8 @@ import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langchain.agents import create_agent as create_react_agent
 from rich.console import Console
 
 from src.config import get_settings
@@ -16,11 +22,20 @@ from src.tools.search_client import SearchClient
 
 console = Console()
 
-_SCORE_SYSTEM_PROMPT = """\
-You are a senior recruiter. Given a candidate profile and a list of job search results,
-score each job's relevance to the candidate (0.0 to 1.0) and extract structured data.
 
-Return ONLY a JSON array:
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+_SCORE_SYSTEM_PROMPT = """\
+You are a senior recruiter with access to job search tools.
+
+Your task:
+1. Use the `search_jobs_online` tool to search for job postings using the provided queries.
+   Call the tool once per query.
+2. Collect all results, remove duplicates, and score each job's relevance to the
+   candidate profile (0.0 to 1.0).
+3. Return ONLY a JSON array of scored job objects:
 [
   {
     "title": "Job Title",
@@ -42,6 +57,47 @@ Score guidelines:
 """
 
 
+# ---------------------------------------------------------------------------
+# Tool factory
+# ---------------------------------------------------------------------------
+
+def make_search_jobs_tool(search_client: SearchClient, max_results_per_query: int = 10) -> Any:
+    """Return a LangChain tool that searches for jobs via *search_client*."""
+
+    @tool
+    def search_jobs_online(query: str) -> str:
+        """Search for job postings online matching the given query.
+
+        Args:
+            query: Search query string, e.g. "Staff Engineer Python remote".
+
+        Returns:
+            JSON array of raw job search results from the web.
+        """
+        results = search_client.search_jobs(query, max_results=max_results_per_query)
+        return json.dumps(results)
+
+    return search_jobs_online
+
+
+# ---------------------------------------------------------------------------
+# Agent factory
+# ---------------------------------------------------------------------------
+
+def create_job_search_agent(
+    llm: Any,
+    search_client: SearchClient,
+    max_results: int = 10,
+) -> Any:
+    """Return a compiled LangGraph ReAct agent for job market search."""
+    search_tool = make_search_jobs_tool(search_client, max_results_per_query=max_results)
+    return create_react_agent(llm, tools=[search_tool])
+
+
+# ---------------------------------------------------------------------------
+# Public class
+# ---------------------------------------------------------------------------
+
 class JobSearchAgent:
     """Search job market and rank results against a candidate's profile."""
 
@@ -52,64 +108,49 @@ class JobSearchAgent:
     ) -> None:
         self._llm = llm
         self._search_client = search_client
+        self._agent: Any = None  # lazy-init
 
-    def _get_llm(self) -> Any:
-        return self._llm if self._llm is not None else get_llm(temperature=0.1)
-
-    def _get_search_client(self) -> SearchClient:
-        if self._search_client is not None:
-            return self._search_client
-        return SearchClient()
+    def _get_agent(self) -> Any:
+        if self._agent is None:
+            llm = self._llm if self._llm is not None else get_llm(temperature=0.1)
+            client = self._search_client if self._search_client is not None else SearchClient()
+            settings = get_settings()
+            self._agent = create_job_search_agent(llm, client, settings.max_job_results)
+        return self._agent
 
     def search_jobs(self, resume_data: ResumeData) -> list[JobRole]:
         """Build queries from *resume_data*, search, score and return JobRole list."""
-        settings = get_settings()
         queries = _build_queries(resume_data)
-        raw_results: list[dict[str, Any]] = []
+        candidate_summary = _candidate_summary(resume_data)
 
-        client = self._get_search_client()
-        for query in queries:
-            console.print(f"[cyan]🔍 Searching:[/cyan] {query}")
-            results = client.search_jobs(query, max_results=settings.max_job_results // len(queries))
-            raw_results.extend(results)
+        console.print(f"[cyan]🔍 Searching for jobs with {len(queries)} queries…[/cyan]")
 
-        if not raw_results:
-            console.print("[yellow]⚠️  No job results found.[/yellow]")
-            return []
-
-        console.print(
-            f"[cyan]🤖 Scoring {len(raw_results)} results against your profile…[/cyan]"
+        prompt = (
+            f"Search for job openings matching this candidate profile:\n{candidate_summary}\n\n"
+            f"Use the search_jobs_online tool for each of the following queries:\n"
+            + "\n".join(f"- {q}" for q in queries)
+            + "\n\nAfter all searches, score each result and return ONLY a JSON array."
         )
-        scored = self._score_with_llm(resume_data, raw_results)
-        scored.sort(key=lambda j: j.match_score, reverse=True)
-        console.print(f"[green]✅ Found {len(scored)} relevant job postings.[/green]")
-        return scored
 
-    def _score_with_llm(
-        self, resume_data: ResumeData, raw: list[dict[str, Any]]
-    ) -> list[JobRole]:
-        """Ask LLM to score and structure raw search results."""
-        candidate_summary = (
-            f"Role: {resume_data.current_role}\n"
-            f"Experience: {resume_data.experience_years} years\n"
-            f"Skills: {', '.join(resume_data.skills[:20])}\n"
-            f"Target roles: {', '.join(resume_data.target_roles)}"
+        agent = self._get_agent()
+        result = agent.invoke(
+            {
+                "messages": [
+                    SystemMessage(content=_SCORE_SYSTEM_PROMPT),
+                    HumanMessage(content=prompt),
+                ]
+            }
         )
-        raw_text = json.dumps(raw[:30], indent=2)  # cap at 30 to stay within context
 
-        llm = self._get_llm()
-        messages = [
-            SystemMessage(content=_SCORE_SYSTEM_PROMPT),
-            HumanMessage(
-                content=(
-                    f"Candidate profile:\n{candidate_summary}\n\n"
-                    f"Search results (JSON):\n{raw_text}"
-                )
-            ),
-        ]
-        response = llm.invoke(messages)
-        content = response.content if hasattr(response, "content") else str(response)
-        data = _parse_json_array(content)
+        last_msg = result["messages"][-1]
+        last_content = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+        if not isinstance(last_content, str):
+            last_content = " ".join(
+                c.get("text", "") if isinstance(c, dict) else str(c)
+                for c in last_content
+            )
+
+        data = _parse_json_array(str(last_content))
 
         jobs: list[JobRole] = []
         for item in data:
@@ -117,8 +158,20 @@ class JobSearchAgent:
                 jobs.append(JobRole(**item))
             except Exception:
                 continue
+
+        jobs.sort(key=lambda j: j.match_score, reverse=True)
+
+        if not jobs:
+            console.print("[yellow]⚠️  No job results found.[/yellow]")
+        else:
+            console.print(f"[green]✅ Found {len(jobs)} relevant job postings.[/green]")
+
         return jobs
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _build_queries(resume_data: ResumeData) -> list[str]:
     """Build 2-3 targeted search queries from the resume."""
@@ -137,6 +190,15 @@ def _build_queries(resume_data: ResumeData) -> list[str]:
         queries.append("software engineer job opening 2024")
 
     return queries
+
+
+def _candidate_summary(resume_data: ResumeData) -> str:
+    return (
+        f"Role: {resume_data.current_role}\n"
+        f"Experience: {resume_data.experience_years} years\n"
+        f"Skills: {', '.join(resume_data.skills[:20])}\n"
+        f"Target roles: {', '.join(resume_data.target_roles)}"
+    )
 
 
 def _parse_json_array(text: str) -> list[dict[str, Any]]:
