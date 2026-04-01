@@ -11,7 +11,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain.agents import create_agent as create_react_agent
+from langgraph.prebuilt import create_react_agent
 from rich.console import Console
 from rich.prompt import Prompt
 from rich.table import Table

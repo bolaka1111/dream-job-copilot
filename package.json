@@ -1,0 +1,14 @@
+{
+  "name": "dream-job-copilot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "concurrently --names \"API,UI\" --prefix-colors \"cyan,magenta\" \"npm run server\" \"npm run client\"",
+    "server": "cd frontend/server && node --watch index.js",
+    "client": "cd frontend/client && npx vite",
+    "install:all": "cd frontend/server && npm install && cd ../client && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
